@@ -4,6 +4,8 @@ import { NanjingTerritoryStore, TerritoryInfo } from '../model/TerritoryModel';
 import { MapAgentBridge } from '../agent/MapAgentBridge';
 import { MapAgentService } from '../agent/MapAgentService';
 import { AgentProcessStep } from '../agent/MapAgentModels';
+import { AuthSession, AuthSessionStore } from '../model/AuthSessionModel';
+import { BackendApiService, AuthSessionDto } from '../service/BackendApiService';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { abilityAccessCtrl, common } from '@kit.AbilityKit';
 import { speechRecognizer } from '@kit.CoreSpeechKit';
@@ -51,6 +53,17 @@ struct Index {
   @State agentSteps: Array<AgentProcessStep> = []
   @State showPrivacyPolicy: boolean = false
   @State showAboutApp: boolean = false
+  @State isLoggedIn: boolean = false
+  @State sessionUserId: string = ''
+  @State sessionDisplayName: string = ''
+  @State sessionDiamonds: number = 100
+  @State sessionToken: string = ''
+  @State authMode: string = 'login'
+  @State authUsername: string = ''
+  @State authPassword: string = ''
+  @State authDisplayName: string = ''
+  @State authMessage: string = ''
+  @State authBusy: boolean = false
 
   private runTimer: number = -1
   private runTimerController: TextTimerController = new TextTimerController()
@@ -64,10 +77,118 @@ struct Index {
   private rankAreas: string[] = ['42.83 km²', '31.56 km²', '6.72 km²', '5.98 km²', '5.21 km²']
   private territories: Array<TerritoryInfo> = NanjingTerritoryStore.getAll()
 
+  aboutToAppear(): void {
+    void this.restoreAuthSession()
+  }
+
   aboutToDisappear(): void {
     this.stopRunTimer()
     this.runTimerController.pause()
     this.stopVoiceRecognition(true)
+  }
+
+  private async restoreAuthSession(): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext
+      const local = await AuthSessionStore.load(context)
+      if (local === null) {
+        this.clearSessionState()
+        return
+      }
+      const remote = await BackendApiService.me(local.token)
+      if (remote === null) {
+        await AuthSessionStore.clear(context)
+        this.clearSessionState()
+        this.authMessage = '登录已失效，请重新登录'
+        return
+      }
+      await this.applyAuthSession(remote)
+    } catch (e) {
+      hilog.warn(VOICE_LOG_DOMAIN, VOICE_LOG_TAG, 'restoreAuthSession failed %{public}s', JSON.stringify(e))
+    }
+  }
+
+  private clearSessionState(): void {
+    this.isLoggedIn = false
+    this.sessionUserId = ''
+    this.sessionDisplayName = ''
+    this.sessionDiamonds = 100
+    this.sessionToken = ''
+  }
+
+  private async applyAuthSession(session: AuthSessionDto): Promise<void> {
+    const context = getContext(this) as common.UIAbilityContext
+    const saved: AuthSession = {
+      userId: session.userId,
+      displayName: session.displayName,
+      diamonds: session.diamonds,
+      token: session.token,
+      expiresAt: session.expiresAt
+    }
+    await AuthSessionStore.save(context, saved)
+    this.isLoggedIn = true
+    this.sessionUserId = session.userId
+    this.sessionDisplayName = session.displayName
+    this.sessionDiamonds = session.diamonds
+    this.sessionToken = session.token
+    this.authMessage = ''
+    this.authPassword = ''
+  }
+
+  private async submitAuth(): Promise<void> {
+    if (this.authBusy) {
+      return
+    }
+    const username = this.authUsername.trim().toLowerCase()
+    const password = this.authPassword
+    if (username.length < 3) {
+      this.authMessage = '用户名至少 3 位'
+      return
+    }
+    if (password.length < 6) {
+      this.authMessage = '密码至少 6 位'
+      return
+    }
+    this.authBusy = true
+    this.authMessage = this.authMode === 'register' ? '注册中…' : '登录中…'
+    try {
+      let session: AuthSessionDto | null = null
+      if (this.authMode === 'register') {
+        const display = this.authDisplayName.trim().length > 0 ? this.authDisplayName.trim() : username
+        session = await BackendApiService.register(username, password, display)
+      } else {
+        session = await BackendApiService.login(username, password)
+      }
+      if (session === null) {
+        this.authMessage = this.authMode === 'register' ? '注册失败（用户名可能已存在）' : '登录失败（用户名或密码错误）'
+        return
+      }
+      await this.applyAuthSession(session)
+      this.authMessage = this.authMode === 'register' ? '注册成功' : '登录成功'
+      promptAction.showToast({ message: this.authMessage, duration: 2000 })
+    } finally {
+      this.authBusy = false
+    }
+  }
+
+  private async logoutAuth(): Promise<void> {
+    const token = this.sessionToken
+    try {
+      if (token.length > 0) {
+        await BackendApiService.logout(token)
+      }
+    } catch (e) {
+      // ignore network errors on logout
+    }
+    try {
+      const context = getContext(this) as common.UIAbilityContext
+      await AuthSessionStore.clear(context)
+    } catch (e) {
+      // ignore
+    }
+    this.clearSessionState()
+    this.authMessage = '已退出登录'
+    promptAction.showToast({ message: '已退出登录', duration: 2000 })
   }
 
   private startSimulatedRun(): void {
@@ -609,7 +730,12 @@ struct Index {
 
   @Builder
   mapBackground() {
-    BaiduMapView({ focusTerritoryId: this.selectedTerritoryId })
+    BaiduMapView({
+      focusTerritoryId: this.selectedTerritoryId,
+      sessionUserId: this.sessionUserId,
+      sessionDisplayName: this.sessionDisplayName,
+      sessionDiamonds: this.sessionDiamonds
+    })
     .width('100%')
     .height('100%')
   }
@@ -994,80 +1120,30 @@ struct Index {
   profilePage() {
     Stack({ alignContent: Alignment.Center }) {
       Column() {
-        this.simpleHeader('我的', '个人中心')
+        this.simpleHeader('我的', this.isLoggedIn ? '已登录' : '登录后同步领地与调试身份')
         Column() {
-          Row() {
-            Column() {
-              Text('T').fontSize(27).fontColor('#FFFFFF')
-            }
-            .width(58)
-            .height(58)
-            .justifyContent(FlexAlign.Center)
-            .backgroundColor('#E88954')
-            .borderRadius(29)
-            Column() {
-              Text('Tom').fontSize(21).fontWeight(FontWeight.Bold)
-              Text('Lv.18 · 黄金跑者').fontSize(13).fontColor('#77837D').margin({ top: 5 })
-            }
-            .alignItems(HorizontalAlign.Start)
-            .margin({ left: 14 })
-            Blank()
-            Text('黄金')
-              .fontSize(11)
-              .fontColor('#B88417')
-              .padding({ left: 8, right: 8, top: 5, bottom: 5 })
-              .backgroundColor('#FFF4D4')
-              .borderRadius(10)
+          if (this.isLoggedIn) {
+            this.profileLoggedInCard()
+          } else {
+            this.profileAuthCard()
           }
-          .width('100%')
-          .padding(18)
-          .backgroundColor('#FFFFFF')
-          .borderRadius(18)
 
-          Column() {
-            Row() {
-              Text('等级 18').fontSize(13).fontWeight(FontWeight.Bold).fontColor('#29372F')
-              Blank()
-              Text(`${this.experience % 1000}/1000 XP`).fontSize(11).fontColor('#7A887F')
-            }.width('100%')
-            Row() {
-              Row()
-                .width(`${Math.min(100, (this.experience % 1000) / 10)}%`)
-                .height(8)
-                .backgroundColor('#F1C338')
-                .borderRadius(4)
-              Blank()
-            }
-            .width('100%')
-            .height(8)
-            .backgroundColor('#EEF2ED')
-            .borderRadius(4)
-            .margin({ top: 9 })
-            Text('下一阶段：传奇 · 共 13 个等级阶段')
-              .fontSize(11)
-              .fontColor('#89958D')
-              .margin({ top: 8 })
+          if (this.isLoggedIn) {
+            GridRow({ columns: 2 }) {
+              GridCol() {
+                this.profileMetric('累计跑步', `${this.totalDistance.toFixed(1)} km`, '#2C9550')
+              }
+              GridCol() {
+                this.profileMetric('已占领领地', `${this.territoryArea.toFixed(2)} km²`, '#2C9550')
+              }
+              GridCol() {
+                this.profileMetric('夺取数量', `${this.conqueredCount} 次`, '#E39A1F')
+              }
+              GridCol() {
+                this.profileMetric('跑步次数', `${this.runCount} 次`, '#536D9D')
+              }
+            }.width('100%').margin({ top: 12 })
           }
-          .width('100%')
-          .padding(16)
-          .backgroundColor('#FFFDF3')
-          .borderRadius(16)
-          .margin({ top: 12 })
-
-          GridRow({ columns: 2 }) {
-            GridCol() {
-              this.profileMetric('累计跑步', `${this.totalDistance.toFixed(1)} km`, '#2C9550')
-            }
-            GridCol() {
-              this.profileMetric('已占领领地', `${this.territoryArea.toFixed(2)} km²`, '#2C9550')
-            }
-            GridCol() {
-              this.profileMetric('夺取数量', `${this.conqueredCount} 次`, '#E39A1F')
-            }
-            GridCol() {
-              this.profileMetric('跑步次数', `${this.runCount} 次`, '#536D9D')
-            }
-          }.width('100%').margin({ top: 12 })
 
           Column() {
             Row() {
@@ -1121,6 +1197,159 @@ struct Index {
     }
     .width('100%')
     .height('100%')
+  }
+
+  @Builder
+  profileLoggedInCard() {
+    Column() {
+      Row() {
+        Column() {
+          Text(this.sessionDisplayName.length > 0
+            ? this.sessionDisplayName.substring(0, 1).toUpperCase()
+            : 'U')
+            .fontSize(27)
+            .fontColor('#FFFFFF')
+        }
+        .width(58)
+        .height(58)
+        .justifyContent(FlexAlign.Center)
+        .backgroundColor('#35A95B')
+        .borderRadius(29)
+        Column() {
+          Text(this.sessionDisplayName).fontSize(21).fontWeight(FontWeight.Bold).fontColor('#1E2D25')
+          Text(`@${this.sessionUserId}`).fontSize(13).fontColor('#77837D').margin({ top: 5 })
+          Text(`钻石 ${this.sessionDiamonds}💎`).fontSize(12).fontColor('#B88417').margin({ top: 4 })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .margin({ left: 14 })
+        Blank()
+      }
+      .width('100%')
+      Text('该账号即地图调试 / 圈地同步使用的当前用户')
+        .fontSize(11)
+        .fontColor('#7A887F')
+        .width('100%')
+        .margin({ top: 12 })
+      Button('退出登录')
+        .width('100%')
+        .height(40)
+        .fontSize(14)
+        .fontColor('#B91C1C')
+        .backgroundColor('#FEE2E2')
+        .borderRadius(12)
+        .margin({ top: 14 })
+        .onClick(() => {
+          void this.logoutAuth()
+        })
+    }
+    .width('100%')
+    .padding(18)
+    .backgroundColor('#FFFFFF')
+    .borderRadius(18)
+  }
+
+  @Builder
+  profileAuthCard() {
+    Column() {
+      Row() {
+        Button('登录')
+          .layoutWeight(1)
+          .height(34)
+          .fontSize(13)
+          .fontColor(this.authMode === 'login' ? '#FFFFFF' : '#166534')
+          .backgroundColor(this.authMode === 'login' ? '#35A95B' : '#EAF5EC')
+          .borderRadius(10)
+          .onClick(() => {
+            this.authMode = 'login'
+            this.authMessage = ''
+          })
+        Button('注册')
+          .layoutWeight(1)
+          .height(34)
+          .fontSize(13)
+          .fontColor(this.authMode === 'register' ? '#FFFFFF' : '#1D4ED8')
+          .backgroundColor(this.authMode === 'register' ? '#3B82F6' : '#EEF5FF')
+          .borderRadius(10)
+          .margin({ left: 8 })
+          .onClick(() => {
+            this.authMode = 'register'
+            this.authMessage = ''
+          })
+      }.width('100%')
+
+      Text('用户名')
+        .fontSize(12)
+        .fontColor('#4B5563')
+        .width('100%')
+        .margin({ top: 14 })
+      TextInput({ text: this.authUsername, placeholder: '3-32 位字母数字或下划线' })
+        .height(40)
+        .fontSize(14)
+        .backgroundColor('#F4F7F4')
+        .borderRadius(10)
+        .margin({ top: 6 })
+        .onChange((value: string) => {
+          this.authUsername = value
+        })
+
+      if (this.authMode === 'register') {
+        Text('昵称（可选）')
+          .fontSize(12)
+          .fontColor('#4B5563')
+          .width('100%')
+          .margin({ top: 10 })
+        TextInput({ text: this.authDisplayName, placeholder: '显示名称' })
+          .height(40)
+          .fontSize(14)
+          .backgroundColor('#F4F7F4')
+          .borderRadius(10)
+          .margin({ top: 6 })
+          .onChange((value: string) => {
+            this.authDisplayName = value
+          })
+      }
+
+      Text('密码')
+        .fontSize(12)
+        .fontColor('#4B5563')
+        .width('100%')
+        .margin({ top: 10 })
+      TextInput({ text: this.authPassword, placeholder: '至少 6 位' })
+        .height(40)
+        .fontSize(14)
+        .backgroundColor('#F4F7F4')
+        .borderRadius(10)
+        .margin({ top: 6 })
+        .type(InputType.Password)
+        .onChange((value: string) => {
+          this.authPassword = value
+        })
+
+      if (this.authMessage.length > 0) {
+        Text(this.authMessage)
+          .fontSize(12)
+          .fontColor('#B45309')
+          .width('100%')
+          .margin({ top: 10 })
+      }
+
+      Button(this.authBusy ? '请稍候…' : (this.authMode === 'register' ? '注册并登录' : '登录'))
+        .width('100%')
+        .height(42)
+        .fontSize(15)
+        .fontColor('#FFFFFF')
+        .backgroundColor(this.authMode === 'register' ? '#3B82F6' : '#35A95B')
+        .borderRadius(12)
+        .margin({ top: 14 })
+        .enabled(!this.authBusy)
+        .onClick(() => {
+          void this.submitAuth()
+        })
+    }
+    .width('100%')
+    .padding(18)
+    .backgroundColor('#FFFFFF')
+    .borderRadius(18)
   }
 
   private privacyPolicyBody(): string {

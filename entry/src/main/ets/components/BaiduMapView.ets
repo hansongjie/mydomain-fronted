@@ -27,6 +27,7 @@ import {
 } from '../agent/MapAgentModels';
 import { BackendConfig } from '../config/BackendConfig';
 import { BackendApiService, BackendTrackPoint } from '../service/BackendApiService';
+import { AuthSessionStore } from '../model/AuthSessionModel';
 
 const BUNDLED_TERRITORY_RAWFILE: string = 'mydomai-territory-20260731-130832.mydomai.json';
 const BUNDLED_TERRITORY_FLAG: string = 'appended_rawfile_20260731_130832';
@@ -67,6 +68,11 @@ interface MapTapLog {
   lng: number;
   loopCount: number;
   hit: number;
+}
+
+interface PendingDeletedLoop {
+  ownerId: string;
+  loopId: number;
 }
 
 const LOG_DOMAIN: number = 0x0000;
@@ -127,6 +133,10 @@ const AGENT_ROUTE_FILL: string = '#93C5FD33';
 @Component
 export struct BaiduMapView {
   @Prop focusTerritoryId: number = -1;
+  /** 与「我的」登录会话同步：谁登录就相当于调试选中谁 */
+  @Prop @Watch('onSessionUserChanged') sessionUserId: string = '';
+  @Prop sessionDisplayName: string = '';
+  @Prop sessionDiamonds: number = DEFAULT_DEBUG_DIAMONDS;
   private mapController: MapController | null = null;
   private mapOptions: MapOptions = new MapOptions({
       mapStatus: new MapStatus({
@@ -189,7 +199,7 @@ export struct BaiduMapView {
   @State private loopInfoDurationText: string = '—';
   @State private loopInfoPaceText: string = '—';
   @State private loopInfoSpeedText: string = '—';
-  @State private currentDebugUserId: string = 'user_a';
+  @State private currentDebugUserId: string = '';
   @State private userADiamonds: number = DEFAULT_DEBUG_DIAMONDS;
   @State private userBDiamonds: number = DEFAULT_DEBUG_DIAMONDS;
   @State private trapSetupCostText: string = `${TerritoryItemDefaults.TRAP_DIAMOND_COST}`;
@@ -258,6 +268,9 @@ export struct BaiduMapView {
   private remoteTrackPendingPoints: Array<BackendTrackPoint> = [];
   private remoteSyncInFlight: boolean = false;
   private remoteSyncQueued: boolean = false;
+  /** 排队等待上传的显式删除（ownerId + clientLoopId） */
+  private pendingDeletedLoops: Array<PendingDeletedLoop> = [];
+  private queuedSyncOwnerIds: Array<string> = [];
   private territoryPullInFlight: boolean = false;
   private lastTerritoryPullOk: boolean = false;
   private lastTerritoryPushOk: boolean = false;
@@ -365,13 +378,49 @@ export struct BaiduMapView {
     void this.bootstrapMapData();
   }
 
+  onSessionUserChanged(): void {
+    void this.applySessionIdentity(true);
+  }
+
   private async bootstrapMapData(): Promise<void> {
     await this.restoreDebugTerritory();
     await this.restorePlacedItems();
     await this.restoreDebugDiamonds();
     await this.preloadDefaultTerritoryCache();
-    // 启动只拉取后端，不自动回传，避免本地旧数据覆盖管理台修改
-    await this.connectBackendAndSync(false);
+    await this.applySessionIdentity(true);
+  }
+
+  /** 用「我的」登录身份驱动当前调试用户 */
+  private async applySessionIdentity(pullBackend: boolean): Promise<void> {
+    const userId = this.sessionUserId;
+    if (userId.length === 0) {
+      this.currentDebugUserId = '';
+      this.debugMessage = '请先在「我的」登录后再圈地 / 同步';
+      this.backendStatusText = '未登录';
+      return;
+    }
+    const changed = this.currentDebugUserId !== userId;
+    this.currentDebugUserId = userId;
+    this.setUserDiamonds(userId, this.sessionDiamonds);
+    if (userId === 'user_b') {
+      this.draftStrokeColor = DEBUG_USER_B_COLOR;
+      this.draftColorText = DEBUG_USER_B_COLOR;
+      this.draftFillColor = DebugLoopStore.toFillColor(DEBUG_USER_B_COLOR);
+      this.draftFillColorText = this.draftFillColor;
+    } else {
+      this.draftStrokeColor = DEBUG_USER_A_COLOR;
+      this.draftColorText = DEBUG_USER_A_COLOR;
+      this.draftFillColor = DebugLoopStore.toFillColor(DEBUG_USER_A_COLOR);
+      this.draftFillColorText = this.draftFillColor;
+    }
+    const label = this.sessionDisplayName.length > 0 ? this.sessionDisplayName : DebugLoopStore.ownerLabel(userId);
+    this.debugMessage = `当前用户：${label} · 钻石 ${this.getCurrentUserDiamonds()}`;
+    if (pullBackend && (changed || AuthSessionStore.isLoggedIn())) {
+      if (changed) {
+        this.triggeredTrapIds = [];
+      }
+      await this.connectBackendAndSync(false);
+    }
   }
 
   private async refreshTerritoryFromBackend(): Promise<void> {
@@ -419,6 +468,11 @@ export struct BaiduMapView {
       this.backendStatusText = '后端: 已关闭';
       return;
     }
+    const userId = this.currentDebugUserId;
+    if (userId.length === 0) {
+      this.backendStatusText = '未登录';
+      return;
+    }
     this.backendStatusText = `后端: 连接中 ${BackendConfig.BASE_URL}`;
     const ok = await BackendApiService.health();
     if (generation !== this.backendConnectGeneration) {
@@ -429,11 +483,15 @@ export struct BaiduMapView {
       return;
     }
     this.backendStatusText = '后端: 已连接';
-    const userId = this.currentDebugUserId;
-    const displayName = userId === 'user_b' ? '用户B' : '用户A';
-    await BackendApiService.upsertUser(userId, displayName, this.getCurrentUserDiamonds());
-    if (generation !== this.backendConnectGeneration) {
-      return;
+    // 已登录用户由 auth 创建，无需再 upsert；仅兼容旧本地身份
+    if (!AuthSessionStore.isLoggedIn()) {
+      const displayName = this.sessionDisplayName.length > 0
+        ? this.sessionDisplayName
+        : DebugLoopStore.ownerLabel(userId);
+      await BackendApiService.upsertUser(userId, displayName, this.getCurrentUserDiamonds());
+      if (generation !== this.backendConnectGeneration) {
+        return;
+      }
     }
     const pulled = await this.pullTerritoryFromBackend();
     if (generation !== this.backendConnectGeneration) {
@@ -521,11 +579,7 @@ export struct BaiduMapView {
     if (bundle.nextPlacedItemId > this.nextPlacedItemId) {
       this.nextPlacedItemId = bundle.nextPlacedItemId;
     }
-    if (userId === 'user_a' && bundle.userADiamonds !== undefined) {
-      this.userADiamonds = bundle.userADiamonds;
-    } else if (userId === 'user_b' && bundle.userBDiamonds !== undefined) {
-      this.userBDiamonds = bundle.userBDiamonds;
-    }
+    this.applyRemoteDiamonds(bundle, userId);
     const userLoopCount = this.countLoopsForUser(userId);
     this.debugMessage = `已从后端覆盖 ${DebugLoopStore.ownerLabel(userId)} 的 ${userLoopCount} 块领地`;
   }
@@ -540,13 +594,24 @@ export struct BaiduMapView {
     if (bundle.nextPlacedItemId > this.nextPlacedItemId) {
       this.nextPlacedItemId = bundle.nextPlacedItemId;
     }
-    if (userId === 'user_a' && bundle.userADiamonds !== undefined) {
-      this.userADiamonds = bundle.userADiamonds;
-    } else if (userId === 'user_b' && bundle.userBDiamonds !== undefined) {
-      this.userBDiamonds = bundle.userBDiamonds;
-    }
+    this.applyRemoteDiamonds(bundle, userId);
     const userLoopCount = this.countLoopsForUser(userId);
     this.debugMessage = `已从后端同步 ${DebugLoopStore.ownerLabel(userId)} 的 ${userLoopCount} 块领地`;
+  }
+
+  private applyRemoteDiamonds(bundle: TerritoryExportBundle, userId: string): void {
+    let diamonds = -1;
+    if (bundle.diamonds !== undefined) {
+      diamonds = bundle.diamonds;
+    } else if (userId === 'user_b' && bundle.userBDiamonds !== undefined) {
+      diamonds = bundle.userBDiamonds;
+    } else if (bundle.userADiamonds !== undefined) {
+      diamonds = bundle.userADiamonds;
+    }
+    if (diamonds >= 0) {
+      this.setUserDiamonds(userId, diamonds);
+      AuthSessionStore.updateDiamonds(diamonds);
+    }
   }
 
   private countLoopsForUser(userId: string): number {
@@ -670,40 +735,96 @@ export struct BaiduMapView {
     }
   }
 
+  private queueLoopDeletion(ownerId: string, loopId: number): void {
+    for (let i = 0; i < this.pendingDeletedLoops.length; i++) {
+      if (this.pendingDeletedLoops[i].ownerId === ownerId && this.pendingDeletedLoops[i].loopId === loopId) {
+        return;
+      }
+    }
+    const ref: PendingDeletedLoop = { ownerId: ownerId, loopId: loopId };
+    this.pendingDeletedLoops.push(ref);
+  }
+
+  private takeDeletedLoopIdsForUser(userId: string): Array<number> {
+    const ids: Array<number> = [];
+    const remain: Array<PendingDeletedLoop> = [];
+    for (let i = 0; i < this.pendingDeletedLoops.length; i++) {
+      const item = this.pendingDeletedLoops[i];
+      if (item.ownerId === userId) {
+        ids.push(item.loopId);
+      } else {
+        remain.push(item);
+      }
+    }
+    this.pendingDeletedLoops = remain;
+    return ids;
+  }
+
+  private restoreDeletedLoopIds(userId: string, ids: Array<number>): void {
+    for (let i = 0; i < ids.length; i++) {
+      this.queueLoopDeletion(userId, ids[i]);
+    }
+  }
+
+  private enqueueOwnerSync(userId: string): void {
+    for (let i = 0; i < this.queuedSyncOwnerIds.length; i++) {
+      if (this.queuedSyncOwnerIds[i] === userId) {
+        return;
+      }
+    }
+    this.queuedSyncOwnerIds.push(userId);
+  }
+
   private async syncTerritoryToBackend(
     updateStatus: boolean = true,
     generation?: number,
-    skipPull: boolean = false
+    skipPull: boolean = false,
+    targetUserId?: string
   ): Promise<boolean> {
     if (!BackendConfig.ENABLED) {
       return false;
     }
+    const userId = targetUserId !== undefined && targetUserId.length > 0
+      ? targetUserId
+      : this.currentDebugUserId;
     if (this.remoteSyncInFlight) {
       this.remoteSyncQueued = true;
+      this.enqueueOwnerSync(userId);
       return false;
     }
     this.remoteSyncInFlight = true;
     let ok = false;
+    const deletedIds = this.takeDeletedLoopIdsForUser(userId);
     try {
-      if (!skipPull) {
+      if (!skipPull && userId === this.currentDebugUserId) {
         const pulled = await this.pullTerritoryFromBackend();
         if (!pulled) {
+          this.restoreDeletedLoopIds(userId, deletedIds);
           if (updateStatus && (generation === undefined || generation === this.backendConnectGeneration)) {
             this.backendStatusText = '后端: 拉取失败，未上传';
           }
           return false;
         }
       }
+      // #region agent log
+      hilog.info(LOG_DOMAIN, LOG_TAG,
+        '[DBG8add10] push territory user=%{public}s deleted=%{public}d skipPull=%{public}d',
+        userId, deletedIds.length, skipPull ? 1 : 0);
+      // #endregion
       ok = await BackendApiService.syncTerritory(
-        this.currentDebugUserId,
+        userId,
         this.savedLoops,
         this.pendingLoops,
         this.placedItems,
         this.nextLoopId,
         this.nextPlacedItemId,
         this.userADiamonds,
-        this.userBDiamonds
+        this.userBDiamonds,
+        deletedIds
       );
+      if (!ok) {
+        this.restoreDeletedLoopIds(userId, deletedIds);
+      }
       this.lastTerritoryPushOk = ok;
       if (updateStatus && (generation === undefined || generation === this.backendConnectGeneration)) {
         this.backendStatusText = ok ? '后端: 已同步' : '后端: 上传失败';
@@ -711,10 +832,30 @@ export struct BaiduMapView {
       return ok;
     } finally {
       this.remoteSyncInFlight = false;
-      if (this.remoteSyncQueued) {
+      if (this.remoteSyncQueued || this.queuedSyncOwnerIds.length > 0) {
         this.remoteSyncQueued = false;
-        void this.syncTerritoryToBackend(updateStatus, generation, true);
+        const nextOwners: Array<string> = [];
+        for (let i = 0; i < this.queuedSyncOwnerIds.length; i++) {
+          nextOwners.push(this.queuedSyncOwnerIds[i]);
+        }
+        this.queuedSyncOwnerIds = [];
+        if (nextOwners.length === 0) {
+          void this.syncTerritoryToBackend(updateStatus, generation, true);
+        } else {
+          void this.pushTerritoriesForOwners(nextOwners, updateStatus, generation);
+        }
       }
+    }
+  }
+
+  /** 依次上传多个用户的领地（占领后需同步受害方） */
+  private async pushTerritoriesForOwners(
+    ownerIds: Array<string>,
+    updateStatus: boolean = true,
+    generation?: number
+  ): Promise<void> {
+    for (let i = 0; i < ownerIds.length; i++) {
+      await this.syncTerritoryToBackend(updateStatus, generation, true, ownerIds[i]);
     }
   }
 
@@ -1330,6 +1471,8 @@ export struct BaiduMapView {
       return;
     }
     const loopName = loop.name;
+    const ownerId = this.resolveLoopOwnerId(loop);
+    this.queueLoopDeletion(ownerId, loopId);
     if (this.isPendingLoop(loopId)) {
       const nextPending: Array<DebugLoopRecord> = [];
       for (let i = 0; i < this.pendingLoops.length; i++) {
@@ -1346,20 +1489,20 @@ export struct BaiduMapView {
         }
       }
       this.savedLoops = nextSaved;
-      this.saveAllLoops();
     }
     this.removeLoopOverlay(loopId);
-    this.removePlacedItemsForLoop(loopId);
+    this.removePlacedItemsForLoop(loopId, false);
     this.clearPendingLoopSingleTap();
     this.showLoopEditDialog = false;
     this.selectedLoopId = -1;
     this.debugMessage = `已删除并释放「${loopName}」`;
     // #region agent log
-    hilog.info(LOG_DOMAIN, LOG_TAG, '[K] loop deleted loopId=%{public}d', loopId);
+    hilog.info(LOG_DOMAIN, LOG_TAG, '[K] loop deleted loopId=%{public}d owner=%{public}s', loopId, ownerId);
     // #endregion
+    void this.persistAndPushOwners([ownerId]);
   }
 
-  private removePlacedItemsForLoop(loopId: number): void {
+  private removePlacedItemsForLoop(loopId: number, syncAfter: boolean = true): void {
     const remaining: Array<PlacedItemRecord> = [];
     let removedCount = 0;
     for (let i = 0; i < this.placedItems.length; i++) {
@@ -1374,11 +1517,13 @@ export struct BaiduMapView {
     }
     this.placedItems = remaining;
     this.refreshAllPlacedItemOverlays();
-    this.savePlacedItems();
     // #region agent log
     hilog.info(LOG_DOMAIN, LOG_TAG, '[P] items cleared loopId=%{public}d removed=%{public}d remaining=%{public}d',
       loopId, removedCount, remaining.length);
     // #endregion
+    if (syncAfter) {
+      void this.savePlacedItems(true);
+    }
   }
 
   private purgePlacedItemsForMissingLoops(): void {
@@ -1728,6 +1873,10 @@ export struct BaiduMapView {
   }
 
   private generateDebugLoop(): void {
+    if (this.currentDebugUserId.length === 0) {
+      this.debugMessage = '请先在「我的」登录';
+      return;
+    }
     if (this.showTrapDialog) {
       this.debugMessage = '掉进陷阱中，请先处理陷阱';
       return;
@@ -1809,6 +1958,10 @@ export struct BaiduMapView {
   }
 
   private completeDebugTerritory(): void {
+    if (this.currentDebugUserId.length === 0) {
+      this.debugMessage = '请先在「我的」登录';
+      return;
+    }
     if (this.pendingLoops.length === 0) {
       this.debugMessage = '请先生成闭环';
       return;
@@ -2593,6 +2746,7 @@ export struct BaiduMapView {
     const replacementMap: Map<number, DebugLoopRecord> = new Map();
     const pendingAdditions: Array<DebugLoopRecord> = [];
     const savedAdditions: Array<DebugLoopRecord> = [];
+    const affectedOwners: Array<string> = [attackerOwner];
     let conqueredArea = 0;
     let savedMutated = false;
 
@@ -2600,6 +2754,17 @@ export struct BaiduMapView {
       const victim = victims[i];
       if (victim.id === attacker.id || !PolygonClipper.overlaps(attacker, victim)) {
         continue;
+      }
+      const victimOwner = this.resolveLoopOwnerId(victim);
+      let ownerKnown = false;
+      for (let o = 0; o < affectedOwners.length; o++) {
+        if (affectedOwners[o] === victimOwner) {
+          ownerKnown = true;
+          break;
+        }
+      }
+      if (!ownerKnown) {
+        affectedOwners.push(victimOwner);
       }
       conqueredArea += PolygonClipper.intersectionArea(attacker, victim);
       removeIds.push(victim.id);
@@ -2609,6 +2774,11 @@ export struct BaiduMapView {
         (attacker.longitudes[0] + victim.longitudes[0]) / 2
       );
       if (remainRings.length === 0) {
+        // 领地被完全吃掉：本地移除 + 后端显式删除
+        this.queueLoopDeletion(victimOwner, victim.id);
+        if (!this.isLoopPending(victim.id)) {
+          savedMutated = true;
+        }
         continue;
       }
       for (let r = 0; r < remainRings.length; r++) {
@@ -2631,6 +2801,10 @@ export struct BaiduMapView {
           savedMutated = true;
         }
       }
+      if (!replacementMap.has(victim.id)) {
+        // 切割后无有效残留 → 等同整块删除
+        this.queueLoopDeletion(victimOwner, victim.id);
+      }
       if (!this.isLoopPending(victim.id)) {
         savedMutated = true;
       }
@@ -2643,18 +2817,22 @@ export struct BaiduMapView {
     this.pendingLoops = this.applyConquestToLoops(this.pendingLoops, removeIds, replacementMap, pendingAdditions);
     this.savedLoops = this.applyConquestToLoops(this.savedLoops, removeIds, replacementMap, savedAdditions);
     for (let i = 0; i < removeIds.length; i++) {
-      this.removePlacedItemsForLoop(removeIds[i]);
+      // 无 replacement 的 id 表示整块删除，清理放置物；有 replacement 时 loopId 仍保留
+      if (!replacementMap.has(removeIds[i])) {
+        this.removePlacedItemsForLoop(removeIds[i], false);
+      }
     }
     this.purgePlacedItemsForMissingLoops();
-    if (savedMutated) {
+    // #region agent log
+    hilog.info(LOG_DOMAIN, LOG_TAG,
+      '[DBG8add10] conquest owner=%{public}s area=%{public}f victims=%{public}d owners=%{public}d',
+      attackerOwner, conqueredArea, removeIds.length, affectedOwners.length);
+    // #endregion
+    if (savedMutated || affectedOwners.length > 1) {
       setTimeout(() => {
-        this.saveAllLoops();
+        void this.persistAndPushOwners(affectedOwners);
       }, 0);
     }
-    // #region agent log
-    hilog.info(LOG_DOMAIN, LOG_TAG, '[L] conquest owner=%{public}s area=%{public}f victims=%{public}d',
-      attackerOwner, conqueredArea, removeIds.length);
-    // #endregion
     return conqueredArea;
   }
 
@@ -3256,14 +3434,15 @@ export struct BaiduMapView {
     // #endregion
   }
 
-  private async savePlacedItems(): Promise<void> {
+  private async savePlacedItems(skipPull: boolean = true): Promise<void> {
     try {
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const store = await preferences.getPreferences(context, { name: 'debug_territory' });
       await store.put('placedItems', TerritoryItemStore.serializeItems(this.placedItems));
       await store.put('nextPlacedItemId', this.nextPlacedItemId);
       await store.flush();
-      void this.syncTerritoryToBackend();
+      // 默认 skipPull，避免拉取把刚删除/刚切割的本地领地冲掉
+      void this.syncTerritoryToBackend(true, undefined, skipPull);
     } catch (error) {
       console.error(`Save placed items failed: ${JSON.stringify(error)}`);
     }
@@ -3539,13 +3718,37 @@ export struct BaiduMapView {
 
   private async saveAllLoops(): Promise<void> {
     try {
-      await this.persistTerritoryLocally();
-      // 圈地后直接上传，勿先拉取（拉取失败会阻断上传；并发刷新也可能冲掉本地）
-      void this.syncTerritoryToBackend(true, undefined, true);
+      await this.persistAndPushOwners([this.currentDebugUserId]);
     } catch (error) {
       this.debugMessage = '闭环已生成，但本地保存失败';
       console.error(`Save debug loops failed: ${JSON.stringify(error)}`);
     }
+  }
+
+  /** 本地持久化后，按用户依次上传（含显式删除与占领后的受害方） */
+  private async persistAndPushOwners(ownerIds: Array<string>): Promise<void> {
+    await this.persistTerritoryLocally();
+    const uniqueOwners: Array<string> = [];
+    for (let i = 0; i < ownerIds.length; i++) {
+      const id = ownerIds[i];
+      let exists = false;
+      for (let j = 0; j < uniqueOwners.length; j++) {
+        if (uniqueOwners[j] === id) {
+          exists = true;
+          break;
+        }
+      }
+      if (!exists && id.length > 0) {
+        uniqueOwners.push(id);
+      }
+    }
+    if (uniqueOwners.length === 0) {
+      uniqueOwners.push(this.currentDebugUserId);
+    }
+    // #region agent log
+    hilog.info(LOG_DOMAIN, LOG_TAG, '[DBG8add10] persistAndPush owners=%{public}d', uniqueOwners.length);
+    // #endregion
+    await this.pushTerritoriesForOwners(uniqueOwners, true, undefined);
   }
 
   private async restoreDebugTerritory(): Promise<void> {
@@ -3605,35 +3808,26 @@ export struct BaiduMapView {
   @Builder
   debugUserSection() {
     Column() {
-      Text('调试用户').fontSize(12).fontColor('#3D4A44').width('100%').margin({ bottom: 6 })
-      Row() {
-        Button('用户A')
-          .layoutWeight(1)
-          .height(30)
+      Text('同步').fontSize(12).fontColor('#3D4A44').width('100%').margin({ bottom: 6 })
+      if (this.currentDebugUserId.length === 0) {
+        Text('未登录：请到「我的」注册 / 登录')
           .fontSize(11)
-          .fontColor(this.currentDebugUserId === 'user_a' ? '#FFFFFF' : '#2D7F46')
-          .backgroundColor(this.currentDebugUserId === 'user_a' ? DEBUG_GLASS_GREEN : DEBUG_GLASS)
-          .borderRadius(10)
-          .onClick(() => {
-            this.switchDebugUser('user_a');
-          })
-        Button('用户B')
-          .layoutWeight(1)
-          .height(30)
+          .fontColor('#B45309')
+          .width('100%')
+      } else {
+        Text(`当前：${this.sessionDisplayName.length > 0 ? this.sessionDisplayName : DebugLoopStore.ownerLabel(this.currentDebugUserId)}`)
           .fontSize(11)
-          .fontColor(this.currentDebugUserId === 'user_b' ? '#FFFFFF' : '#2563EB')
-          .backgroundColor(this.currentDebugUserId === 'user_b' ? DEBUG_GLASS_BLUE : DEBUG_GLASS)
-          .borderRadius(10)
-          .margin({ left: 6 })
-          .onClick(() => {
-            this.switchDebugUser('user_b');
-          })
-      }.width('100%')
-      Text(`当前：${DebugLoopStore.ownerLabel(this.currentDebugUserId)} · 重叠区域归当前用户`).fontSize(10).fontColor('#4B5563').width('100%').margin({ top: 4 })
-      Text(`A:${this.userADiamonds}💎  B:${this.userBDiamonds}💎  当前:${this.getCurrentUserDiamonds()}💎`)
-        .fontSize(10).fontColor('#4B5563').width('100%').margin({ top: 2 })
+          .fontColor('#1E2D25')
+          .fontWeight(FontWeight.Medium)
+          .width('100%')
+        Text(`账号 ${this.currentDebugUserId} · 钻石 ${this.getCurrentUserDiamonds()}💎`)
+          .fontSize(10)
+          .fontColor('#4B5563')
+          .width('100%')
+          .margin({ top: 2 })
+      }
       Text(this.backendStatusText)
-        .fontSize(10).fontColor('#475569').width('100%').margin({ top: 2 })
+        .fontSize(10).fontColor('#475569').width('100%').margin({ top: 4 })
       Button('从后端刷新领地')
         .width('100%')
         .height(28)
@@ -3642,6 +3836,7 @@ export struct BaiduMapView {
         .backgroundColor(DEBUG_GLASS)
         .borderRadius(10)
         .margin({ top: 6 })
+        .enabled(this.currentDebugUserId.length > 0)
         .onClick(() => {
           void this.refreshTerritoryFromBackend();
         })
@@ -3653,6 +3848,7 @@ export struct BaiduMapView {
         .backgroundColor(DEBUG_GLASS)
         .borderRadius(10)
         .margin({ top: 6 })
+        .enabled(this.currentDebugUserId.length > 0)
         .onClick(() => {
           this.fitMapToCurrentUserLoops();
         })

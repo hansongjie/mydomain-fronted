@@ -92,6 +92,29 @@ interface TerritorySyncData {
 interface JsonHeaders {
   'Content-Type': string;
   Accept?: string;
+  Authorization?: string;
+}
+
+interface AuthBody {
+  username: string;
+  password: string;
+  displayName?: string;
+}
+
+export interface AuthSessionDto {
+  userId: string;
+  displayName: string;
+  diamonds: number;
+  token: string;
+  expiresAt: string;
+}
+
+interface AuthSessionData {
+  userId?: string;
+  displayName?: string;
+  diamonds?: number;
+  token?: string;
+  expiresAt?: string;
 }
 
 export class BackendApiService {
@@ -104,6 +127,64 @@ export class BackendApiService {
       return raw !== null;
     } catch (e) {
       return false;
+    }
+  }
+
+  static async register(username: string, password: string, displayName: string): Promise<AuthSessionDto | null> {
+    const body: AuthBody = {
+      username: username,
+      password: password,
+      displayName: displayName
+    };
+    return BackendApiService.parseAuthResponse(
+      await BackendApiService.request('POST', '/auth/register', body)
+    );
+  }
+
+  static async login(username: string, password: string): Promise<AuthSessionDto | null> {
+    const body: AuthBody = {
+      username: username,
+      password: password
+    };
+    return BackendApiService.parseAuthResponse(
+      await BackendApiService.request('POST', '/auth/login', body)
+    );
+  }
+
+  static async logout(token: string): Promise<boolean> {
+    const raw = await BackendApiService.request('POST', '/auth/logout', null, BackendConfig.READ_TIMEOUT_MS, token);
+    return raw !== null;
+  }
+
+  static async me(token: string): Promise<AuthSessionDto | null> {
+    return BackendApiService.parseAuthResponse(
+      await BackendApiService.request('GET', '/auth/me', null, BackendConfig.READ_TIMEOUT_MS, token)
+    );
+  }
+
+  private static parseAuthResponse(raw: string | null): AuthSessionDto | null {
+    if (raw === null) {
+      return null;
+    }
+    try {
+      const envelope = JSON.parse(raw) as BackendEnvelope;
+      if (envelope.ok === false) {
+        return null;
+      }
+      const data = envelope.data as AuthSessionData;
+      if (data === undefined || data === null || data.userId === undefined || data.token === undefined) {
+        return null;
+      }
+      const session: AuthSessionDto = {
+        userId: `${data.userId}`,
+        displayName: data.displayName !== undefined ? `${data.displayName}` : `${data.userId}`,
+        diamonds: data.diamonds !== undefined ? Number(data.diamonds) : 100,
+        token: `${data.token}`,
+        expiresAt: data.expiresAt !== undefined ? `${data.expiresAt}` : ''
+      };
+      return session;
+    } catch (e) {
+      return null;
     }
   }
 
@@ -177,7 +258,8 @@ export class BackendApiService {
     nextLoopId: number,
     nextPlacedItemId: number,
     userADiamonds: number,
-    userBDiamonds: number
+    userBDiamonds: number,
+    deletedLoopIds: Array<number> = []
   ): Promise<boolean> {
     const ownerSaved: Array<DebugLoopRecord> = [];
     const ownerPending: Array<DebugLoopRecord> = [];
@@ -206,6 +288,19 @@ export class BackendApiService {
       userADiamonds,
       userBDiamonds
     );
+    if (deletedLoopIds.length > 0) {
+      bundle.deletedLoopIds = deletedLoopIds;
+    }
+    if (userId === 'user_b') {
+      bundle.diamonds = userBDiamonds;
+    } else if (userId === 'user_a') {
+      bundle.diamonds = userADiamonds;
+    } else {
+      bundle.diamonds = userADiamonds;
+    }
+    hilog.info(LOG_DOMAIN, LOG_TAG,
+      'syncTerritory user=%{public}s saved=%{public}d pending=%{public}d deleted=%{public}d',
+      userId, ownerSaved.length, ownerPending.length, deletedLoopIds.length);
     const raw = await BackendApiService.request(
       'PUT',
       `/territory/${userId}`,
@@ -297,10 +392,13 @@ export class BackendApiService {
       pendingLoops: pendingLoops,
       placedItems: placedItems
     };
-    if (userId === 'user_a' && data.diamonds !== undefined) {
-      bundle.userADiamonds = data.diamonds;
-    } else if (userId === 'user_b' && data.diamonds !== undefined) {
-      bundle.userBDiamonds = data.diamonds;
+    if (data.diamonds !== undefined) {
+      bundle.diamonds = data.diamonds;
+      if (userId === 'user_b') {
+        bundle.userBDiamonds = data.diamonds;
+      } else {
+        bundle.userADiamonds = data.diamonds;
+      }
     }
     return bundle;
   }
@@ -378,7 +476,8 @@ export class BackendApiService {
     method: string,
     path: string,
     body: Object | null,
-    readTimeoutMs: number = BackendConfig.READ_TIMEOUT_MS
+    readTimeoutMs: number = BackendConfig.READ_TIMEOUT_MS,
+    authToken: string = ''
   ): Promise<string | null> {
     if (!BackendConfig.ENABLED) {
       return null;
@@ -389,11 +488,16 @@ export class BackendApiService {
         'Content-Type': 'application/json',
         Accept: 'application/json'
       };
+      if (authToken.length > 0) {
+        headers.Authorization = `Bearer ${authToken}`;
+      }
       let httpMethod: http.RequestMethod = http.RequestMethod.GET;
       if (method === 'POST') {
         httpMethod = http.RequestMethod.POST;
       } else if (method === 'PUT') {
         httpMethod = http.RequestMethod.PUT;
+      } else if (method === 'DELETE') {
+        httpMethod = http.RequestMethod.DELETE;
       }
       const options: http.HttpRequestOptions = {
         method: httpMethod,

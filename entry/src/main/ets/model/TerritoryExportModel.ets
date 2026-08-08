@@ -11,8 +11,13 @@ export interface TerritoryExportBundle {
   savedLoops: Array<DebugLoopRecord>;
   pendingLoops: Array<DebugLoopRecord>;
   placedItems: Array<PlacedItemRecord>;
+  /** 显式删除的 clientLoopId（同步时由后端删除） */
+  deletedLoopIds?: Array<number>;
+  deletedItemIds?: Array<number>;
   userADiamonds?: number;
   userBDiamonds?: number;
+  /** 当前同步用户的钻石数 */
+  diamonds?: number;
 }
 
 export class TerritoryExportStore {
