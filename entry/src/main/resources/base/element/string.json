@@ -1,0 +1,32 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "module description"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "description"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "我的领地"
+    },
+    {
+      "name": "app_name",
+      "value": "我的领地"
+    },
+    {
+      "name": "location_permission_reason",
+      "value": "用于在地图中展示当前位置和周边领地"
+    },
+    {
+      "name": "map_permission_reason",
+      "value": "用于加载地图数据和展示周边地图区域"
+    },
+    {
+      "name": "microphone_permission_reason",
+      "value": "用于语音识别，识别跑步指令和语音输入"
+    }
+  ]
+}

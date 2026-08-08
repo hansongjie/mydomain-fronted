@@ -1,0 +1,17 @@
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+.DS_Store
+.cursor/
+*.log
+# 含真实 API Key，本地保留；仓库用 example 文件
+/entry/src/main/ets/config/DeepSeekConfig.ets
